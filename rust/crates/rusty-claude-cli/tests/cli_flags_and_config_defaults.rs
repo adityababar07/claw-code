@@ -80,7 +80,7 @@ fn slash_command_names_match_known_commands_and_suggest_nearby_unknown_ones() {
         .expect("claw should launch");
     let unknown_output = Command::new(env!("CARGO_BIN_EXE_claw"))
         .current_dir(&temp_dir)
-        .arg("/stats")
+        .arg("/zstats")
         .output()
         .expect("claw should launch");
 
@@ -97,7 +97,7 @@ fn slash_command_names_match_known_commands_and_suggest_nearby_unknown_ones() {
         String::from_utf8_lossy(&unknown_output.stderr)
     );
     let stderr = String::from_utf8(unknown_output.stderr).expect("stderr should be utf8");
-    assert!(stderr.contains("unknown slash command outside the REPL: /stats"));
+    assert!(stderr.contains("unknown slash command outside the REPL: /zstats"));
     assert!(stderr.contains("Did you mean"));
     assert!(stderr.contains("/status"));
 

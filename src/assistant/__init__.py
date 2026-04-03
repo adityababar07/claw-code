@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
+from src._archive_helper import load_archive_metadata
 
-SNAPSHOT_PATH = Path(__file__).resolve().parent.parent / 'reference_data' / 'subsystems' / 'assistant.json'
-_SNAPSHOT = json.loads(SNAPSHOT_PATH.read_text())
+_SNAPSHOT = load_archive_metadata("assistant")
 
-ARCHIVE_NAME = _SNAPSHOT['archive_name']
-MODULE_COUNT = _SNAPSHOT['module_count']
-SAMPLE_FILES = tuple(_SNAPSHOT['sample_files'])
+ARCHIVE_NAME = _SNAPSHOT["archive_name"]
+MODULE_COUNT = _SNAPSHOT["module_count"]
+SAMPLE_FILES = tuple(_SNAPSHOT["sample_files"])
 PORTING_NOTE = f"Python placeholder package for '{ARCHIVE_NAME}' with {MODULE_COUNT} archived module references."
 
-__all__ = ['ARCHIVE_NAME', 'MODULE_COUNT', 'PORTING_NOTE', 'SAMPLE_FILES']
+__all__ = ["ARCHIVE_NAME", "MODULE_COUNT", "PORTING_NOTE", "SAMPLE_FILES"]

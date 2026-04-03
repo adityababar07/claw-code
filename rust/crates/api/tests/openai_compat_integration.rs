@@ -5,8 +5,9 @@ use std::sync::{Mutex as StdMutex, OnceLock};
 
 use api::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
-    InputContentBlock, InputMessage, MessageRequest, OpenAiCompatClient, OpenAiCompatConfig,
-    OutputContentBlock, ProviderClient, StreamEvent, ToolChoice, ToolDefinition,
+    InputContentBlock, InputMessage, MessageDeltaEvent, MessageRequest, OpenAiCompatClient,
+    OpenAiCompatConfig, OutputContentBlock, ProviderClient, StreamEvent, ToolChoice,
+    ToolDefinition,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -193,6 +194,82 @@ async fn stream_message_normalizes_text_and_multiple_tool_calls() {
     let request = captured.first().expect("captured request");
     assert_eq!(request.path, "/chat/completions");
     assert!(request.body.contains("\"stream\":true"));
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn openai_streaming_requests_opt_into_usage_chunks() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = concat!(
+        "data: {\"id\":\"chatcmpl_openai_stream\",\"model\":\"gpt-5\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+        "data: {\"id\":\"chatcmpl_openai_stream\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"id\":\"chatcmpl_openai_stream\",\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":4}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response_with_headers(
+            "200 OK",
+            "text/event-stream",
+            sse,
+            &[("x-request-id", "req_openai_stream")],
+        )],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let mut stream = client
+        .stream_message(&sample_request(false))
+        .await
+        .expect("stream should start");
+
+    assert_eq!(stream.request_id(), Some("req_openai_stream"));
+
+    let mut events = Vec::new();
+    while let Some(event) = stream.next_event().await.expect("event should parse") {
+        events.push(event);
+    }
+
+    assert!(matches!(events[0], StreamEvent::MessageStart(_)));
+    assert!(matches!(
+        events[1],
+        StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+            content_block: OutputContentBlock::Text { .. },
+            ..
+        })
+    ));
+    assert!(matches!(
+        events[2],
+        StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            delta: ContentBlockDelta::TextDelta { .. },
+            ..
+        })
+    ));
+    assert!(matches!(
+        events[3],
+        StreamEvent::ContentBlockStop(ContentBlockStopEvent { index: 0 })
+    ));
+    assert!(matches!(
+        events[4],
+        StreamEvent::MessageDelta(MessageDeltaEvent { .. })
+    ));
+    assert!(matches!(events[5], StreamEvent::MessageStop(_)));
+
+    match &events[4] {
+        StreamEvent::MessageDelta(MessageDeltaEvent { usage, .. }) => {
+            assert_eq!(usage.input_tokens, 9);
+            assert_eq!(usage.output_tokens, 4);
+        }
+        other => panic!("expected message delta, got {other:?}"),
+    }
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("captured request");
+    assert_eq!(request.path, "/chat/completions");
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(body["stream_options"], json!({"include_usage": true}));
 }
 
 #[allow(clippy::await_holding_lock)]

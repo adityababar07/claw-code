@@ -35,6 +35,41 @@ Or authenticate via OAuth:
 claw login
 ```
 
+## Mock parity harness
+
+The workspace now includes a deterministic Anthropic-compatible mock service and a clean-environment CLI harness for end-to-end parity checks.
+
+```bash
+cd rust/
+
+# Run the scripted clean-environment harness
+./scripts/run_mock_parity_harness.sh
+
+# Or start the mock service manually for ad hoc CLI runs
+cargo run -p mock-anthropic-service -- --bind 127.0.0.1:0
+```
+
+Harness coverage:
+
+- `streaming_text`
+- `read_file_roundtrip`
+- `grep_chunk_assembly`
+- `write_file_allowed`
+- `write_file_denied`
+- `multi_tool_turn_roundtrip`
+- `bash_stdout_roundtrip`
+- `bash_permission_prompt_approved`
+- `bash_permission_prompt_denied`
+- `plugin_tool_roundtrip`
+
+Primary artifacts:
+
+- `crates/mock-anthropic-service/` — reusable mock Anthropic-compatible service
+- `crates/rusty-claude-cli/tests/mock_parity_harness.rs` — clean-env CLI harness
+- `scripts/run_mock_parity_harness.sh` — reproducible wrapper
+- `scripts/run_mock_parity_diff.py` — scenario checklist + PARITY mapping runner
+- `mock_parity_scenarios.json` — scenario-to-PARITY manifest
+
 ## Features
 
 | Feature | Status |
@@ -124,6 +159,7 @@ rust/
     ├── api/                # Anthropic API client + SSE streaming
     ├── commands/           # Shared slash-command registry
     ├── compat-harness/     # TS manifest extraction harness
+    ├── mock-anthropic-service/ # Deterministic local Anthropic-compatible mock
     ├── runtime/            # Session, config, permissions, MCP, prompts
     ├── rusty-claude-cli/   # Main CLI binary (`claw`)
     └── tools/              # Built-in tool implementations
@@ -134,6 +170,7 @@ rust/
 - **api** — HTTP client, SSE stream parser, request/response types, auth (API key + OAuth bearer)
 - **commands** — Slash command definitions and help text generation
 - **compat-harness** — Extracts tool/prompt manifests from upstream TS source
+- **mock-anthropic-service** — Deterministic `/v1/messages` mock for CLI parity tests and local harness runs
 - **runtime** — `ConversationRuntime` agentic loop, `ConfigLoader` hierarchy, `Session` persistence, permission policy, MCP client, system prompt assembly, usage tracking
 - **rusty-claude-cli** — REPL, one-shot prompt, streaming display, tool call rendering, CLI argument parsing
 - **tools** — Tool specs + execution: Bash, ReadFile, WriteFile, EditFile, GlobSearch, GrepSearch, WebSearch, WebFetch, Agent, TodoWrite, NotebookEdit, Skill, ToolSearch, REPL runtimes
@@ -141,7 +178,7 @@ rust/
 ## Stats
 
 - **~20K lines** of Rust
-- **6 crates** in workspace
+- **7 crates** in workspace
 - **Binary name:** `claw`
 - **Default model:** `claude-opus-4-6`
 - **Default permissions:** `danger-full-access`

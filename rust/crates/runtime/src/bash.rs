@@ -134,8 +134,8 @@ async fn execute_bash_async(
     };
 
     let (output, interrupted) = output_result;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stdout = truncate_output(&String::from_utf8_lossy(&output.stdout));
+    let stderr = truncate_output(&String::from_utf8_lossy(&output.stderr));
     let no_output_expected = Some(stdout.trim().is_empty() && stderr.trim().is_empty());
     let return_code_interpretation = output.status.code().and_then(|code| {
         if code == 0 {
@@ -279,5 +279,55 @@ mod tests {
         .expect("bash command should execute");
 
         assert!(!output.sandbox_status.expect("sandbox status").enabled);
+    }
+}
+
+/// Maximum output bytes before truncation (16 KiB, matching upstream).
+const MAX_OUTPUT_BYTES: usize = 16_384;
+
+/// Truncate output to `MAX_OUTPUT_BYTES`, appending a marker when trimmed.
+fn truncate_output(s: &str) -> String {
+    if s.len() <= MAX_OUTPUT_BYTES {
+        return s.to_string();
+    }
+    // Find the last valid UTF-8 boundary at or before MAX_OUTPUT_BYTES
+    let mut end = MAX_OUTPUT_BYTES;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = s[..end].to_string();
+    truncated.push_str("\n\n[output truncated — exceeded 16384 bytes]");
+    truncated
+}
+
+#[cfg(test)]
+mod truncation_tests {
+    use super::*;
+
+    #[test]
+    fn short_output_unchanged() {
+        let s = "hello world";
+        assert_eq!(truncate_output(s), s);
+    }
+
+    #[test]
+    fn long_output_truncated() {
+        let s = "x".repeat(20_000);
+        let result = truncate_output(&s);
+        assert!(result.len() < 20_000);
+        assert!(result.ends_with("[output truncated — exceeded 16384 bytes]"));
+    }
+
+    #[test]
+    fn exact_boundary_unchanged() {
+        let s = "a".repeat(MAX_OUTPUT_BYTES);
+        assert_eq!(truncate_output(&s), s);
+    }
+
+    #[test]
+    fn one_over_boundary_truncated() {
+        let s = "a".repeat(MAX_OUTPUT_BYTES + 1);
+        let result = truncate_output(&s);
+        assert!(result.contains("[output truncated"));
     }
 }

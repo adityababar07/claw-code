@@ -5,6 +5,7 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use runtime::ContentBlock;
 use runtime::Session;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -51,7 +52,12 @@ fn resumed_binary_accepts_slash_commands_with_arguments() {
     assert!(stdout.contains("Export"));
     assert!(stdout.contains("wrote transcript"));
     assert!(stdout.contains(export_path.to_str().expect("utf8 path")));
-    assert!(stdout.contains("Cleared resumed session file"));
+    assert!(stdout.contains("Session cleared"));
+    assert!(stdout.contains("Mode             resumed session reset"));
+    assert!(stdout.contains("Previous session"));
+    assert!(stdout.contains("Resume previous  claw --resume"));
+    assert!(stdout.contains("Backup           "));
+    assert!(stdout.contains("Session file     "));
 
     let export = fs::read_to_string(&export_path).expect("export file should exist");
     assert!(export.contains("# Conversation Export"));
@@ -59,6 +65,18 @@ fn resumed_binary_accepts_slash_commands_with_arguments() {
 
     let restored = Session::load_from_path(&session_path).expect("cleared session should load");
     assert!(restored.messages.is_empty());
+
+    let backup_path = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("  Backup           "))
+        .map(PathBuf::from)
+        .expect("clear output should include backup path");
+    let backup = Session::load_from_path(&backup_path).expect("backup session should load");
+    assert_eq!(backup.messages.len(), 1);
+    assert!(matches!(
+        backup.messages[0].blocks.first(),
+        Some(ContentBlock::Text { text }) if text == "ship the slash command harness"
+    ));
 }
 
 #[test]

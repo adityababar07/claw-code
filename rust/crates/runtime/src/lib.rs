@@ -1,4 +1,5 @@
 mod bash;
+pub mod bash_validation;
 mod bootstrap;
 mod compact;
 mod config;
@@ -6,16 +7,21 @@ mod conversation;
 mod file_ops;
 mod hooks;
 mod json;
+pub mod lsp_client;
 mod mcp;
 mod mcp_client;
 mod mcp_stdio;
+pub mod mcp_tool_bridge;
 mod oauth;
+pub mod permission_enforcer;
 mod permissions;
 mod prompt;
 mod remote;
 pub mod sandbox;
 mod session;
 mod sse;
+pub mod task_registry;
+pub mod team_cron_registry;
 mod usage;
 
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};

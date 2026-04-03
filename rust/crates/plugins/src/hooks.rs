@@ -73,7 +73,7 @@ impl HookRunner {
 
     #[must_use]
     pub fn run_pre_tool_use(&self, tool_name: &str, tool_input: &str) -> HookRunResult {
-        self.run_commands(
+        Self::run_commands(
             HookEvent::PreToolUse,
             &self.hooks.pre_tool_use,
             tool_name,
@@ -91,7 +91,7 @@ impl HookRunner {
         tool_output: &str,
         is_error: bool,
     ) -> HookRunResult {
-        self.run_commands(
+        Self::run_commands(
             HookEvent::PostToolUse,
             &self.hooks.post_tool_use,
             tool_name,
@@ -108,7 +108,7 @@ impl HookRunner {
         tool_input: &str,
         tool_error: &str,
     ) -> HookRunResult {
-        self.run_commands(
+        Self::run_commands(
             HookEvent::PostToolUseFailure,
             &self.hooks.post_tool_use_failure,
             tool_name,
@@ -119,7 +119,6 @@ impl HookRunner {
     }
 
     fn run_commands(
-        &self,
         event: HookEvent,
         commands: &[String],
         tool_name: &str,
@@ -136,7 +135,7 @@ impl HookRunner {
         let mut messages = Vec::new();
 
         for command in commands {
-            match self.run_command(
+            match Self::run_command(
                 command,
                 event,
                 tool_name,
@@ -174,9 +173,8 @@ impl HookRunner {
         HookRunResult::allow(messages)
     }
 
-    #[allow(clippy::too_many_arguments, clippy::unused_self)]
+    #[allow(clippy::too_many_arguments)]
     fn run_command(
-        &self,
         command: &str,
         event: HookEvent,
         tool_name: &str,

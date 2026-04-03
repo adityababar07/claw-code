@@ -847,7 +847,7 @@ mod tests {
                         AssistantEvent::MessageStop,
                     ])
                 }
-                _ => Err(RuntimeError::new("unexpected extra API call")),
+                _ => unreachable!("extra API call"),
             }
         }
     }
@@ -1156,7 +1156,7 @@ mod tests {
                             AssistantEvent::MessageStop,
                         ])
                     }
-                    _ => Err(RuntimeError::new("unexpected extra API call")),
+                    _ => unreachable!("extra API call"),
                 }
             }
         }
@@ -1231,7 +1231,7 @@ mod tests {
                             AssistantEvent::MessageStop,
                         ])
                     }
-                    _ => Err(RuntimeError::new("unexpected extra API call")),
+                    _ => unreachable!("extra API call"),
                 }
             }
         }
@@ -1545,7 +1545,6 @@ mod tests {
 
     #[test]
     fn auto_compaction_threshold_defaults_and_parses_values() {
-        // given / when / then
         assert_eq!(
             parse_auto_compaction_threshold(None),
             DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD

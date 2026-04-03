@@ -2,22 +2,8 @@ use crate::error::ApiError;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 use crate::providers::anthropic::{self, AnthropicClient, AuthSource};
 use crate::providers::openai_compat::{self, OpenAiCompatClient, OpenAiCompatConfig};
-use crate::providers::{self, Provider, ProviderKind};
+use crate::providers::{self, ProviderKind};
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
-
-async fn send_via_provider<P: Provider>(
-    provider: &P,
-    request: &MessageRequest,
-) -> Result<MessageResponse, ApiError> {
-    provider.send_message(request).await
-}
-
-async fn stream_via_provider<P: Provider>(
-    provider: &P,
-    request: &MessageRequest,
-) -> Result<P::Stream, ApiError> {
-    provider.stream_message(request).await
-}
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
@@ -89,8 +75,8 @@ impl ProviderClient {
         request: &MessageRequest,
     ) -> Result<MessageResponse, ApiError> {
         match self {
-            Self::Anthropic(client) => send_via_provider(client, request).await,
-            Self::Xai(client) | Self::OpenAi(client) => send_via_provider(client, request).await,
+            Self::Anthropic(client) => client.send_message(request).await,
+            Self::Xai(client) | Self::OpenAi(client) => client.send_message(request).await,
         }
     }
 
@@ -99,10 +85,12 @@ impl ProviderClient {
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
         match self {
-            Self::Anthropic(client) => stream_via_provider(client, request)
+            Self::Anthropic(client) => client
+                .stream_message(request)
                 .await
                 .map(MessageStream::Anthropic),
-            Self::Xai(client) | Self::OpenAi(client) => stream_via_provider(client, request)
+            Self::Xai(client) | Self::OpenAi(client) => client
+                .stream_message(request)
                 .await
                 .map(MessageStream::OpenAiCompat),
         }

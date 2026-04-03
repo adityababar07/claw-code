@@ -442,7 +442,7 @@ fn decode_hex(byte: u8) -> Result<u8, String> {
         b'0'..=b'9' => Ok(byte - b'0'),
         b'a'..=b'f' => Ok(byte - b'a' + 10),
         b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err(format!("invalid percent-encoding byte: {byte}")),
+        _ => Err(format!("invalid percent byte: {byte}")),
     }
 }
 

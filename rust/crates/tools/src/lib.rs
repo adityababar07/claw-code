@@ -11,13 +11,50 @@ use api::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    edit_file, execute_bash, glob_search, grep_search, load_system_prompt, read_file, write_file,
-    ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ContentBlock, ConversationMessage,
-    ConversationRuntime, GrepSearchInput, MessageRole, PermissionMode, PermissionPolicy,
-    PromptCacheEvent, RuntimeError, Session, ToolError, ToolExecutor,
+    edit_file, execute_bash, glob_search, grep_search, load_system_prompt,
+    lsp_client::LspRegistry,
+    mcp_tool_bridge::McpToolRegistry,
+    permission_enforcer::{EnforcementResult, PermissionEnforcer},
+    read_file,
+    task_registry::TaskRegistry,
+    team_cron_registry::{CronRegistry, TeamRegistry},
+    write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ContentBlock,
+    ConversationMessage, ConversationRuntime, GrepSearchInput, MessageRole, PermissionMode,
+    PermissionPolicy, PromptCacheEvent, RuntimeError, Session, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+/// Global task registry shared across tool invocations within a session.
+fn global_lsp_registry() -> &'static LspRegistry {
+    use std::sync::OnceLock;
+    static REGISTRY: OnceLock<LspRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(LspRegistry::new)
+}
+
+fn global_mcp_registry() -> &'static McpToolRegistry {
+    use std::sync::OnceLock;
+    static REGISTRY: OnceLock<McpToolRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(McpToolRegistry::new)
+}
+
+fn global_team_registry() -> &'static TeamRegistry {
+    use std::sync::OnceLock;
+    static REGISTRY: OnceLock<TeamRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(TeamRegistry::new)
+}
+
+fn global_cron_registry() -> &'static CronRegistry {
+    use std::sync::OnceLock;
+    static REGISTRY: OnceLock<CronRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(CronRegistry::new)
+}
+
+fn global_task_registry() -> &'static TaskRegistry {
+    use std::sync::OnceLock;
+    static REGISTRY: OnceLock<TaskRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(TaskRegistry::new)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolManifestEntry {
@@ -56,10 +93,11 @@ pub struct ToolSpec {
     pub required_permission: PermissionMode,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct GlobalToolRegistry {
     plugin_tools: Vec<PluginTool>,
     runtime_tools: Vec<RuntimeToolDefinition>,
+    enforcer: Option<PermissionEnforcer>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,6 +114,7 @@ impl GlobalToolRegistry {
         Self {
             plugin_tools: Vec::new(),
             runtime_tools: Vec::new(),
+            enforcer: None,
         }
     }
 
@@ -101,6 +140,7 @@ impl GlobalToolRegistry {
         Ok(Self {
             plugin_tools,
             runtime_tools: Vec::new(),
+            enforcer: None,
         })
     }
 
@@ -129,6 +169,12 @@ impl GlobalToolRegistry {
 
         self.runtime_tools = runtime_tools;
         Ok(self)
+    }
+
+    #[must_use]
+    pub fn with_enforcer(mut self, enforcer: PermissionEnforcer) -> Self {
+        self.set_enforcer(enforcer);
+        self
     }
 
     pub fn normalize_allowed_tools(
@@ -272,9 +318,13 @@ impl GlobalToolRegistry {
         }
     }
 
+    pub fn set_enforcer(&mut self, enforcer: PermissionEnforcer) {
+        self.enforcer = Some(enforcer);
+    }
+
     pub fn execute(&self, name: &str, input: &Value) -> Result<String, String> {
         if mvp_tool_specs().iter().any(|spec| spec.name == name) {
-            return execute_tool(name, input);
+            return execute_tool_with_enforcer(self.enforcer.as_ref(), name, input);
         }
         self.plugin_tools
             .iter()
@@ -662,17 +712,327 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             }),
             required_permission: PermissionMode::DangerFullAccess,
         },
+        ToolSpec {
+            name: "AskUserQuestion",
+            description: "Ask the user a question and wait for their response.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "question": { "type": "string" },
+                    "options": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    }
+                },
+                "required": ["question"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "TaskCreate",
+            description: "Create a background task that runs in a separate subprocess.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string" },
+                    "description": { "type": "string" }
+                },
+                "required": ["prompt"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "TaskGet",
+            description: "Get the status and details of a background task by ID.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" }
+                },
+                "required": ["task_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "TaskList",
+            description: "List all background tasks and their current status.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "TaskStop",
+            description: "Stop a running background task by ID.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" }
+                },
+                "required": ["task_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "TaskUpdate",
+            description: "Send a message or update to a running background task.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "message": { "type": "string" }
+                },
+                "required": ["task_id", "message"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "TaskOutput",
+            description: "Retrieve the output produced by a background task.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" }
+                },
+                "required": ["task_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "TeamCreate",
+            description: "Create a team of sub-agents for parallel task execution.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "tasks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "prompt": { "type": "string" },
+                                "description": { "type": "string" }
+                            },
+                            "required": ["prompt"]
+                        }
+                    }
+                },
+                "required": ["name", "tasks"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "TeamDelete",
+            description: "Delete a team and stop all its running tasks.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "team_id": { "type": "string" }
+                },
+                "required": ["team_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "CronCreate",
+            description: "Create a scheduled recurring task.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "schedule": { "type": "string" },
+                    "prompt": { "type": "string" },
+                    "description": { "type": "string" }
+                },
+                "required": ["schedule", "prompt"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "CronDelete",
+            description: "Delete a scheduled recurring task by ID.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "cron_id": { "type": "string" }
+                },
+                "required": ["cron_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "CronList",
+            description: "List all scheduled recurring tasks.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "LSP",
+            description: "Query Language Server Protocol for code intelligence (symbols, references, diagnostics).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["symbols", "references", "diagnostics", "definition", "hover"] },
+                    "path": { "type": "string" },
+                    "line": { "type": "integer", "minimum": 0 },
+                    "character": { "type": "integer", "minimum": 0 },
+                    "query": { "type": "string" }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "ListMcpResources",
+            description: "List available resources from connected MCP servers.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "ReadMcpResource",
+            description: "Read a specific resource from an MCP server by URI.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" },
+                    "uri": { "type": "string" }
+                },
+                "required": ["uri"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "McpAuth",
+            description: "Authenticate with an MCP server that requires OAuth or credentials.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" }
+                },
+                "required": ["server"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "RemoteTrigger",
+            description: "Trigger a remote action or webhook endpoint.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string" },
+                    "method": { "type": "string", "enum": ["GET", "POST", "PUT", "DELETE"] },
+                    "headers": { "type": "object" },
+                    "body": { "type": "string" }
+                },
+                "required": ["url"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "MCP",
+            description: "Execute a tool provided by a connected MCP server.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" },
+                    "tool": { "type": "string" },
+                    "arguments": { "type": "object" }
+                },
+                "required": ["server", "tool"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "TestingPermission",
+            description: "Test-only tool for verifying permission enforcement behavior.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string" }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
     ]
 }
 
+/// Check permission before executing a tool. Returns Err with denial reason if blocked.
+pub fn enforce_permission_check(
+    enforcer: &PermissionEnforcer,
+    tool_name: &str,
+    input: &Value,
+) -> Result<(), String> {
+    let input_str = serde_json::to_string(input).unwrap_or_default();
+    let result = enforcer.check(tool_name, &input_str);
+
+    match result {
+        EnforcementResult::Allowed => Ok(()),
+        EnforcementResult::Denied { reason, .. } => Err(reason),
+    }
+}
+
 pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
+    execute_tool_with_enforcer(None, name, input)
+}
+
+fn execute_tool_with_enforcer(
+    enforcer: Option<&PermissionEnforcer>,
+    name: &str,
+    input: &Value,
+) -> Result<String, String> {
     match name {
-        "bash" => from_value::<BashCommandInput>(input).and_then(run_bash),
-        "read_file" => from_value::<ReadFileInput>(input).and_then(run_read_file),
-        "write_file" => from_value::<WriteFileInput>(input).and_then(run_write_file),
-        "edit_file" => from_value::<EditFileInput>(input).and_then(run_edit_file),
-        "glob_search" => from_value::<GlobSearchInputValue>(input).and_then(run_glob_search),
-        "grep_search" => from_value::<GrepSearchInput>(input).and_then(run_grep_search),
+        "bash" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<BashCommandInput>(input).and_then(run_bash)
+        }
+        "read_file" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<ReadFileInput>(input).and_then(run_read_file)
+        }
+        "write_file" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<WriteFileInput>(input).and_then(run_write_file)
+        }
+        "edit_file" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<EditFileInput>(input).and_then(run_edit_file)
+        }
+        "glob_search" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<GlobSearchInputValue>(input).and_then(run_glob_search)
+        }
+        "grep_search" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<GrepSearchInput>(input).and_then(run_grep_search)
+        }
         "WebFetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
         "WebSearch" => from_value::<WebSearchInput>(input).and_then(run_web_search),
         "TodoWrite" => from_value::<TodoWriteInput>(input).and_then(run_todo_write),
@@ -690,10 +1050,451 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
         }
         "REPL" => from_value::<ReplInput>(input).and_then(run_repl),
         "PowerShell" => from_value::<PowerShellInput>(input).and_then(run_powershell),
+        "AskUserQuestion" => {
+            from_value::<AskUserQuestionInput>(input).and_then(run_ask_user_question)
+        }
+        "TaskCreate" => from_value::<TaskCreateInput>(input).and_then(run_task_create),
+        "TaskGet" => from_value::<TaskIdInput>(input).and_then(run_task_get),
+        "TaskList" => run_task_list(input.clone()),
+        "TaskStop" => from_value::<TaskIdInput>(input).and_then(run_task_stop),
+        "TaskUpdate" => from_value::<TaskUpdateInput>(input).and_then(run_task_update),
+        "TaskOutput" => from_value::<TaskIdInput>(input).and_then(run_task_output),
+        "TeamCreate" => from_value::<TeamCreateInput>(input).and_then(run_team_create),
+        "TeamDelete" => from_value::<TeamDeleteInput>(input).and_then(run_team_delete),
+        "CronCreate" => from_value::<CronCreateInput>(input).and_then(run_cron_create),
+        "CronDelete" => from_value::<CronDeleteInput>(input).and_then(run_cron_delete),
+        "CronList" => run_cron_list(input.clone()),
+        "LSP" => from_value::<LspInput>(input).and_then(run_lsp),
+        "ListMcpResources" => {
+            from_value::<McpResourceInput>(input).and_then(run_list_mcp_resources)
+        }
+        "ReadMcpResource" => from_value::<McpResourceInput>(input).and_then(run_read_mcp_resource),
+        "McpAuth" => from_value::<McpAuthInput>(input).and_then(run_mcp_auth),
+        "RemoteTrigger" => from_value::<RemoteTriggerInput>(input).and_then(run_remote_trigger),
+        "MCP" => from_value::<McpToolInput>(input).and_then(run_mcp_tool),
+        "TestingPermission" => {
+            from_value::<TestingPermissionInput>(input).and_then(run_testing_permission)
+        }
         _ => Err(format!("unsupported tool: {name}")),
     }
 }
 
+fn maybe_enforce_permission_check(
+    enforcer: Option<&PermissionEnforcer>,
+    tool_name: &str,
+    input: &Value,
+) -> Result<(), String> {
+    if let Some(enforcer) = enforcer {
+        enforce_permission_check(enforcer, tool_name, input)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> {
+    use std::io::{self, BufRead, Write};
+
+    // Display the question to the user via stdout
+    let stdout = io::stdout();
+    let stdin = io::stdin();
+    let mut out = stdout.lock();
+
+    writeln!(out, "\n[Question] {}", input.question).map_err(|e| e.to_string())?;
+
+    if let Some(ref options) = input.options {
+        for (i, option) in options.iter().enumerate() {
+            writeln!(out, "  {}. {}", i + 1, option).map_err(|e| e.to_string())?;
+        }
+        write!(out, "Enter choice (1-{}): ", options.len()).map_err(|e| e.to_string())?;
+    } else {
+        write!(out, "Your answer: ").map_err(|e| e.to_string())?;
+    }
+    out.flush().map_err(|e| e.to_string())?;
+
+    // Read user response from stdin
+    let mut response = String::new();
+    stdin.lock().read_line(&mut response).map_err(|e| e.to_string())?;
+    let response = response.trim().to_string();
+
+    // If options were provided, resolve the numeric choice
+    let answer = if let Some(ref options) = input.options {
+        if let Ok(idx) = response.parse::<usize>() {
+            if idx >= 1 && idx <= options.len() {
+                options[idx - 1].clone()
+            } else {
+                response.clone()
+            }
+        } else {
+            response.clone()
+        }
+    } else {
+        response.clone()
+    };
+
+    to_pretty_json(json!({
+        "question": input.question,
+        "answer": answer,
+        "status": "answered"
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_task_create(input: TaskCreateInput) -> Result<String, String> {
+    let registry = global_task_registry();
+    let task = registry.create(&input.prompt, input.description.as_deref());
+    to_pretty_json(json!({
+        "task_id": task.task_id,
+        "status": task.status,
+        "prompt": task.prompt,
+        "description": task.description,
+        "created_at": task.created_at
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_task_get(input: TaskIdInput) -> Result<String, String> {
+    let registry = global_task_registry();
+    match registry.get(&input.task_id) {
+        Some(task) => to_pretty_json(json!({
+            "task_id": task.task_id,
+            "status": task.status,
+            "prompt": task.prompt,
+            "description": task.description,
+            "created_at": task.created_at,
+            "updated_at": task.updated_at,
+            "messages": task.messages,
+            "team_id": task.team_id
+        })),
+        None => Err(format!("task not found: {}", input.task_id)),
+    }
+}
+
+fn run_task_list(_input: Value) -> Result<String, String> {
+    let registry = global_task_registry();
+    let tasks: Vec<_> = registry
+        .list(None)
+        .into_iter()
+        .map(|t| {
+            json!({
+                "task_id": t.task_id,
+                "status": t.status,
+                "prompt": t.prompt,
+                "description": t.description,
+                "created_at": t.created_at,
+                "updated_at": t.updated_at,
+                "team_id": t.team_id
+            })
+        })
+        .collect();
+    to_pretty_json(json!({
+        "tasks": tasks,
+        "count": tasks.len()
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_task_stop(input: TaskIdInput) -> Result<String, String> {
+    let registry = global_task_registry();
+    match registry.stop(&input.task_id) {
+        Ok(task) => to_pretty_json(json!({
+            "task_id": task.task_id,
+            "status": task.status,
+            "message": "Task stopped"
+        })),
+        Err(e) => Err(e),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_task_update(input: TaskUpdateInput) -> Result<String, String> {
+    let registry = global_task_registry();
+    match registry.update(&input.task_id, &input.message) {
+        Ok(task) => to_pretty_json(json!({
+            "task_id": task.task_id,
+            "status": task.status,
+            "message_count": task.messages.len(),
+            "last_message": input.message
+        })),
+        Err(e) => Err(e),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_task_output(input: TaskIdInput) -> Result<String, String> {
+    let registry = global_task_registry();
+    match registry.output(&input.task_id) {
+        Ok(output) => to_pretty_json(json!({
+            "task_id": input.task_id,
+            "output": output,
+            "has_output": !output.is_empty()
+        })),
+        Err(e) => Err(e),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_team_create(input: TeamCreateInput) -> Result<String, String> {
+    let task_ids: Vec<String> = input
+        .tasks
+        .iter()
+        .filter_map(|t| t.get("task_id").and_then(|v| v.as_str()).map(str::to_owned))
+        .collect();
+    let team = global_team_registry().create(&input.name, task_ids);
+    // Register team assignment on each task
+    for task_id in &team.task_ids {
+        let _ = global_task_registry().assign_team(task_id, &team.team_id);
+    }
+    to_pretty_json(json!({
+        "team_id": team.team_id,
+        "name": team.name,
+        "task_count": team.task_ids.len(),
+        "task_ids": team.task_ids,
+        "status": team.status,
+        "created_at": team.created_at
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_team_delete(input: TeamDeleteInput) -> Result<String, String> {
+    match global_team_registry().delete(&input.team_id) {
+        Ok(team) => to_pretty_json(json!({
+            "team_id": team.team_id,
+            "name": team.name,
+            "status": team.status,
+            "message": "Team deleted"
+        })),
+        Err(e) => Err(e),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_cron_create(input: CronCreateInput) -> Result<String, String> {
+    let entry =
+        global_cron_registry().create(&input.schedule, &input.prompt, input.description.as_deref());
+    to_pretty_json(json!({
+        "cron_id": entry.cron_id,
+        "schedule": entry.schedule,
+        "prompt": entry.prompt,
+        "description": entry.description,
+        "enabled": entry.enabled,
+        "created_at": entry.created_at
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_cron_delete(input: CronDeleteInput) -> Result<String, String> {
+    match global_cron_registry().delete(&input.cron_id) {
+        Ok(entry) => to_pretty_json(json!({
+            "cron_id": entry.cron_id,
+            "schedule": entry.schedule,
+            "status": "deleted",
+            "message": "Cron entry removed"
+        })),
+        Err(e) => Err(e),
+    }
+}
+
+fn run_cron_list(_input: Value) -> Result<String, String> {
+    let entries: Vec<_> = global_cron_registry()
+        .list(false)
+        .into_iter()
+        .map(|e| {
+            json!({
+                "cron_id": e.cron_id,
+                "schedule": e.schedule,
+                "prompt": e.prompt,
+                "description": e.description,
+                "enabled": e.enabled,
+                "run_count": e.run_count,
+                "last_run_at": e.last_run_at,
+                "created_at": e.created_at
+            })
+        })
+        .collect();
+    to_pretty_json(json!({
+        "crons": entries,
+        "count": entries.len()
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_lsp(input: LspInput) -> Result<String, String> {
+    let registry = global_lsp_registry();
+    let action = &input.action;
+    let path = input.path.as_deref();
+    let line = input.line;
+    let character = input.character;
+    let query = input.query.as_deref();
+
+    match registry.dispatch(action, path, line, character, query) {
+        Ok(result) => to_pretty_json(result),
+        Err(e) => to_pretty_json(json!({
+            "action": action,
+            "error": e,
+            "status": "error"
+        })),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_list_mcp_resources(input: McpResourceInput) -> Result<String, String> {
+    let registry = global_mcp_registry();
+    let server = input.server.as_deref().unwrap_or("default");
+    match registry.list_resources(server) {
+        Ok(resources) => {
+            let items: Vec<_> = resources
+                .iter()
+                .map(|r| {
+                    json!({
+                        "uri": r.uri,
+                        "name": r.name,
+                        "description": r.description,
+                        "mime_type": r.mime_type,
+                    })
+                })
+                .collect();
+            to_pretty_json(json!({
+                "server": server,
+                "resources": items,
+                "count": items.len()
+            }))
+        }
+        Err(e) => to_pretty_json(json!({
+            "server": server,
+            "resources": [],
+            "error": e
+        })),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_read_mcp_resource(input: McpResourceInput) -> Result<String, String> {
+    let registry = global_mcp_registry();
+    let uri = input.uri.as_deref().unwrap_or("");
+    let server = input.server.as_deref().unwrap_or("default");
+    match registry.read_resource(server, uri) {
+        Ok(resource) => to_pretty_json(json!({
+            "server": server,
+            "uri": resource.uri,
+            "name": resource.name,
+            "description": resource.description,
+            "mime_type": resource.mime_type
+        })),
+        Err(e) => to_pretty_json(json!({
+            "server": server,
+            "uri": uri,
+            "error": e
+        })),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_mcp_auth(input: McpAuthInput) -> Result<String, String> {
+    let registry = global_mcp_registry();
+    match registry.get_server(&input.server) {
+        Some(state) => to_pretty_json(json!({
+            "server": input.server,
+            "status": state.status,
+            "server_info": state.server_info,
+            "tool_count": state.tools.len(),
+            "resource_count": state.resources.len()
+        })),
+        None => to_pretty_json(json!({
+            "server": input.server,
+            "status": "disconnected",
+            "message": "Server not registered. Use MCP tool to connect first."
+        })),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
+    let method = input.method.unwrap_or_else(|| "GET".to_string());
+    let client = Client::new();
+
+    let mut request = match method.to_uppercase().as_str() {
+        "GET" => client.get(&input.url),
+        "POST" => client.post(&input.url),
+        "PUT" => client.put(&input.url),
+        "DELETE" => client.delete(&input.url),
+        "PATCH" => client.patch(&input.url),
+        "HEAD" => client.head(&input.url),
+        other => return Err(format!("unsupported HTTP method: {other}")),
+    };
+
+    // Apply custom headers
+    if let Some(ref headers) = input.headers {
+        if let Some(obj) = headers.as_object() {
+            for (key, value) in obj {
+                if let Some(val) = value.as_str() {
+                    request = request.header(key.as_str(), val);
+                }
+            }
+        }
+    }
+
+    // Apply body
+    if let Some(ref body) = input.body {
+        request = request.body(body.clone());
+    }
+
+    // Execute with a 30-second timeout
+    let request = request.timeout(Duration::from_secs(30));
+
+    match request.send() {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let body = response.text().unwrap_or_default();
+            let truncated_body = if body.len() > 8192 {
+                format!("{}\n\n[response truncated — {} bytes total]", &body[..8192], body.len())
+            } else {
+                body
+            };
+            to_pretty_json(json!({
+                "url": input.url,
+                "method": method,
+                "status_code": status,
+                "body": truncated_body,
+                "success": status >= 200 && status < 300
+            }))
+        }
+        Err(e) => to_pretty_json(json!({
+            "url": input.url,
+            "method": method,
+            "error": e.to_string(),
+            "success": false
+        })),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_mcp_tool(input: McpToolInput) -> Result<String, String> {
+    let registry = global_mcp_registry();
+    let args = input.arguments.unwrap_or(serde_json::json!({}));
+    match registry.call_tool(&input.server, &input.tool, &args) {
+        Ok(result) => to_pretty_json(json!({
+            "server": input.server,
+            "tool": input.tool,
+            "result": result,
+            "status": "success"
+        })),
+        Err(e) => to_pretty_json(json!({
+            "server": input.server,
+            "tool": input.tool,
+            "error": e,
+            "status": "error"
+        })),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_testing_permission(input: TestingPermissionInput) -> Result<String, String> {
+    to_pretty_json(json!({
+        "action": input.action,
+        "permitted": true,
+        "message": "Testing permission tool stub"
+    }))
+}
 fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> {
     serde_json::from_value(input.clone()).map_err(|error| error.to_string())
 }
@@ -973,6 +1774,105 @@ struct PowerShellInput {
     run_in_background: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+struct AskUserQuestionInput {
+    question: String,
+    #[serde(default)]
+    options: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskCreateInput {
+    prompt: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskIdInput {
+    task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskUpdateInput {
+    task_id: String,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamCreateInput {
+    name: String,
+    tasks: Vec<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamDeleteInput {
+    team_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CronCreateInput {
+    schedule: String,
+    prompt: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CronDeleteInput {
+    cron_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LspInput {
+    action: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    line: Option<u32>,
+    #[serde(default)]
+    character: Option<u32>,
+    #[serde(default)]
+    query: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpResourceInput {
+    #[serde(default)]
+    server: Option<String>,
+    #[serde(default)]
+    uri: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpAuthInput {
+    server: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteTriggerInput {
+    url: String,
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default)]
+    headers: Option<Value>,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpToolInput {
+    server: String,
+    tool: String,
+    #[serde(default)]
+    arguments: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TestingPermissionInput {
+    action: String,
+}
+
 #[derive(Debug, Serialize)]
 struct WebFetchOutput {
     bytes: usize,
@@ -1112,6 +2012,7 @@ struct PlanModeState {
 }
 
 #[derive(Debug, Serialize)]
+#[allow(clippy::struct_excessive_bools)]
 struct PlanModeOutput {
     success: bool,
     operation: String,
@@ -1808,12 +2709,14 @@ fn build_agent_runtime(
         .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
     let allowed_tools = job.allowed_tools.clone();
     let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
-    let tool_executor = SubagentToolExecutor::new(allowed_tools);
+    let permission_policy = agent_permission_policy();
+    let tool_executor = SubagentToolExecutor::new(allowed_tools)
+        .with_enforcer(PermissionEnforcer::new(permission_policy.clone()));
     Ok(ConversationRuntime::new(
         Session::new(),
         api_client,
         tool_executor,
-        agent_permission_policy(),
+        permission_policy,
         job.system_prompt.clone(),
     ))
 }
@@ -2112,11 +3015,17 @@ impl ApiClient for ProviderRuntimeClient {
 
 struct SubagentToolExecutor {
     allowed_tools: BTreeSet<String>,
+    enforcer: Option<PermissionEnforcer>,
 }
 
 impl SubagentToolExecutor {
     fn new(allowed_tools: BTreeSet<String>) -> Self {
-        Self { allowed_tools }
+        Self { allowed_tools, enforcer: None }
+    }
+
+    fn with_enforcer(mut self, enforcer: PermissionEnforcer) -> Self {
+        self.enforcer = Some(enforcer);
+        self
     }
 }
 
@@ -2129,7 +3038,7 @@ impl ToolExecutor for SubagentToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        execute_tool(tool_name, &value).map_err(ToolError::new)
+        execute_tool_with_enforcer(self.enforcer.as_ref(), tool_name, &value).map_err(ToolError::new)
     }
 }
 
@@ -3520,7 +4429,10 @@ mod tests {
         SubagentToolExecutor,
     };
     use api::OutputContentBlock;
-    use runtime::{ApiRequest, AssistantEvent, ConversationRuntime, RuntimeError, Session};
+    use runtime::{
+        permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
+        PermissionMode, PermissionPolicy, RuntimeError, Session, ToolExecutor,
+    };
     use serde_json::json;
 
     fn env_lock() -> &'static Mutex<()> {
@@ -3534,6 +4446,13 @@ mod tests {
             .expect("time")
             .as_nanos();
         std::env::temp_dir().join(format!("clawd-tools-{unique}-{name}"))
+    }
+
+    fn permission_policy_for_mode(mode: PermissionMode) -> PermissionPolicy {
+        mvp_tool_specs().into_iter().fold(
+            PermissionPolicy::new(mode),
+            |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
+        )
     }
 
     #[test]
@@ -3565,6 +4484,50 @@ mod tests {
     fn rejects_unknown_tool_names() {
         let error = execute_tool("nope", &json!({})).expect_err("tool should be rejected");
         assert!(error.contains("unsupported tool"));
+    }
+
+    #[test]
+    fn global_tool_registry_denies_blocked_tool_before_dispatch() {
+        // given
+        let policy = permission_policy_for_mode(PermissionMode::ReadOnly);
+        let registry = GlobalToolRegistry::builtin().with_enforcer(PermissionEnforcer::new(policy));
+
+        // when
+        let error = registry
+            .execute(
+                "write_file",
+                &json!({
+                    "path": "blocked.txt",
+                    "content": "blocked"
+                }),
+            )
+            .expect_err("write tool should be denied before dispatch");
+
+        // then
+        assert!(error.contains("requires workspace-write permission"));
+    }
+
+    #[test]
+    fn subagent_tool_executor_denies_blocked_tool_before_dispatch() {
+        // given
+        let policy = permission_policy_for_mode(PermissionMode::ReadOnly);
+        let mut executor = SubagentToolExecutor::new(BTreeSet::from([String::from("write_file")]))
+            .with_enforcer(PermissionEnforcer::new(policy));
+
+        // when
+        let error = executor
+            .execute(
+                "write_file",
+                &json!({
+                    "path": "blocked.txt",
+                    "content": "blocked"
+                })
+                .to_string(),
+            )
+            .expect_err("subagent write tool should be denied before dispatch");
+
+        // then
+        assert!(error.to_string().contains("requires workspace-write permission"));
     }
 
     #[test]
@@ -4256,7 +5219,7 @@ mod tests {
                         AssistantEvent::MessageStop,
                     ])
                 }
-                _ => panic!("unexpected mock stream call"),
+                _ => unreachable!("extra mock stream call"),
             }
         }
     }
@@ -5067,6 +6030,101 @@ printf 'pwsh:%s' "$1"
         let _ = std::fs::remove_dir_all(empty_dir);
 
         assert!(err.contains("PowerShell executable not found"));
+    }
+
+    fn read_only_registry() -> super::GlobalToolRegistry {
+        use runtime::permission_enforcer::PermissionEnforcer;
+        use runtime::PermissionPolicy;
+
+        let policy = mvp_tool_specs().into_iter().fold(
+            PermissionPolicy::new(runtime::PermissionMode::ReadOnly),
+            |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
+        );
+        let mut registry = super::GlobalToolRegistry::builtin();
+        registry.set_enforcer(PermissionEnforcer::new(policy));
+        registry
+    }
+
+    #[test]
+    fn given_read_only_enforcer_when_bash_then_denied() {
+        let registry = read_only_registry();
+        let err = registry
+            .execute("bash", &json!({ "command": "echo hi" }))
+            .expect_err("bash should be denied in read-only mode");
+        assert!(
+            err.contains("current mode is read-only"),
+            "should cite active mode: {err}"
+        );
+    }
+
+    #[test]
+    fn given_read_only_enforcer_when_write_file_then_denied() {
+        let registry = read_only_registry();
+        let err = registry
+            .execute("write_file", &json!({ "path": "/tmp/x.txt", "content": "x" }))
+            .expect_err("write_file should be denied in read-only mode");
+        assert!(
+            err.contains("current mode is read-only"),
+            "should cite active mode: {err}"
+        );
+    }
+
+    #[test]
+    fn given_read_only_enforcer_when_edit_file_then_denied() {
+        let registry = read_only_registry();
+        let err = registry
+            .execute(
+                "edit_file",
+                &json!({ "path": "/tmp/x.txt", "old_string": "a", "new_string": "b" }),
+            )
+            .expect_err("edit_file should be denied in read-only mode");
+        assert!(
+            err.contains("current mode is read-only"),
+            "should cite active mode: {err}"
+        );
+    }
+
+    #[test]
+    fn given_read_only_enforcer_when_read_file_then_not_permission_denied() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("perm-read");
+        fs::create_dir_all(&root).expect("create root");
+        let file = root.join("readable.txt");
+        fs::write(&file, "content\n").expect("write test file");
+
+        let registry = read_only_registry();
+        let result = registry.execute(
+            "read_file",
+            &json!({ "path": file.display().to_string() }),
+        );
+        assert!(result.is_ok(), "read_file should be allowed: {result:?}");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn given_read_only_enforcer_when_glob_search_then_not_permission_denied() {
+        let registry = read_only_registry();
+        let result = registry.execute("glob_search", &json!({ "pattern": "*.rs" }));
+        assert!(
+            result.is_ok(),
+            "glob_search should be allowed in read-only mode: {result:?}"
+        );
+    }
+
+    #[test]
+    fn given_no_enforcer_when_bash_then_executes_normally() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let registry = super::GlobalToolRegistry::builtin();
+        let result = registry
+            .execute("bash", &json!({ "command": "printf 'ok'" }))
+            .expect("bash should succeed without enforcer");
+        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+        assert_eq!(output["stdout"], "ok");
     }
 
     struct TestServer {

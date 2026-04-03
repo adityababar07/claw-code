@@ -67,6 +67,7 @@ impl OpenAiCompatConfig {
 pub struct OpenAiCompatClient {
     http: reqwest::Client,
     api_key: String,
+    config: OpenAiCompatConfig,
     base_url: String,
     max_retries: u32,
     initial_backoff: Duration,
@@ -74,11 +75,15 @@ pub struct OpenAiCompatClient {
 }
 
 impl OpenAiCompatClient {
+    const fn config(&self) -> OpenAiCompatConfig {
+        self.config
+    }
     #[must_use]
     pub fn new(api_key: impl Into<String>, config: OpenAiCompatConfig) -> Self {
         Self {
             http: reqwest::Client::new(),
             api_key: api_key.into(),
+            config,
             base_url: read_base_url(config),
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
@@ -190,7 +195,7 @@ impl OpenAiCompatClient {
             .post(&request_url)
             .header("content-type", "application/json")
             .bearer_auth(&self.api_key)
-            .json(&build_chat_completion_request(request))
+            .json(&build_chat_completion_request(request, self.config()))
             .send()
             .await
             .map_err(ApiError::from)
@@ -633,7 +638,7 @@ struct ErrorBody {
     message: Option<String>,
 }
 
-fn build_chat_completion_request(request: &MessageRequest) -> Value {
+fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatConfig) -> Value {
     let mut messages = Vec::new();
     if let Some(system) = request.system.as_ref().filter(|value| !value.is_empty()) {
         messages.push(json!({
@@ -651,6 +656,10 @@ fn build_chat_completion_request(request: &MessageRequest) -> Value {
         "messages": messages,
         "stream": request.stream,
     });
+
+    if request.stream && should_request_stream_usage(config) {
+        payload["stream_options"] = json!({ "include_usage": true });
+    }
 
     if let Some(tools) = &request.tools {
         payload["tools"] =
@@ -747,6 +756,10 @@ fn openai_tool_choice(tool_choice: &ToolChoice) -> Value {
             "function": { "name": name },
         }),
     }
+}
+
+fn should_request_stream_usage(config: OpenAiCompatConfig) -> bool {
+    matches!(config.provider_name, "OpenAI")
 }
 
 fn normalize_response(
@@ -951,39 +964,78 @@ mod tests {
 
     #[test]
     fn request_translation_uses_openai_compatible_shape() {
-        let payload = build_chat_completion_request(&MessageRequest {
-            model: "grok-3".to_string(),
-            max_tokens: 64,
-            messages: vec![InputMessage {
-                role: "user".to_string(),
-                content: vec![
-                    InputContentBlock::Text {
-                        text: "hello".to_string(),
-                    },
-                    InputContentBlock::ToolResult {
-                        tool_use_id: "tool_1".to_string(),
-                        content: vec![ToolResultContentBlock::Json {
-                            value: json!({"ok": true}),
-                        }],
-                        is_error: false,
-                    },
-                ],
-            }],
-            system: Some("be helpful".to_string()),
-            tools: Some(vec![ToolDefinition {
-                name: "weather".to_string(),
-                description: Some("Get weather".to_string()),
-                input_schema: json!({"type": "object"}),
-            }]),
-            tool_choice: Some(ToolChoice::Auto),
-            stream: false,
-        });
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "grok-3".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage {
+                    role: "user".to_string(),
+                    content: vec![
+                        InputContentBlock::Text {
+                            text: "hello".to_string(),
+                        },
+                        InputContentBlock::ToolResult {
+                            tool_use_id: "tool_1".to_string(),
+                            content: vec![ToolResultContentBlock::Json {
+                                value: json!({"ok": true}),
+                            }],
+                            is_error: false,
+                        },
+                    ],
+                }],
+                system: Some("be helpful".to_string()),
+                tools: Some(vec![ToolDefinition {
+                    name: "weather".to_string(),
+                    description: Some("Get weather".to_string()),
+                    input_schema: json!({"type": "object"}),
+                }]),
+                tool_choice: Some(ToolChoice::Auto),
+                stream: false,
+            },
+            OpenAiCompatConfig::xai(),
+        );
 
         assert_eq!(payload["messages"][0]["role"], json!("system"));
         assert_eq!(payload["messages"][1]["role"], json!("user"));
         assert_eq!(payload["messages"][2]["role"], json!("tool"));
         assert_eq!(payload["tools"][0]["type"], json!("function"));
         assert_eq!(payload["tool_choice"], json!("auto"));
+    }
+
+    #[test]
+    fn openai_streaming_requests_include_usage_opt_in() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gpt-5".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage::user_text("hello")],
+                system: None,
+                tools: None,
+                tool_choice: None,
+                stream: true,
+            },
+            OpenAiCompatConfig::openai(),
+        );
+
+        assert_eq!(payload["stream_options"], json!({"include_usage": true}));
+    }
+
+    #[test]
+    fn xai_streaming_requests_skip_openai_specific_usage_opt_in() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "grok-3".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage::user_text("hello")],
+                system: None,
+                tools: None,
+                tool_choice: None,
+                stream: true,
+            },
+            OpenAiCompatConfig::xai(),
+        );
+
+        assert!(payload.get("stream_options").is_none());
     }
 
     #[test]
