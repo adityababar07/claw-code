@@ -6,6 +6,7 @@ use crate::types::{MessageRequest, MessageResponse};
 
 pub mod anthropic;
 pub mod openai_compat;
+pub mod ollama;
 
 #[allow(dead_code)]
 pub type ProviderFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ApiError>> + Send + 'a>>;
@@ -30,6 +31,18 @@ pub enum ProviderKind {
     Anthropic,
     Xai,
     OpenAi,
+    Ollama,
+}
+
+impl ProviderKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::Xai => "xai",
+            Self::OpenAi => "openai",
+            Self::Ollama => "ollama",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +149,7 @@ pub fn resolve_model_alias(model: &str) -> String {
                     _ => trimmed,
                 },
                 ProviderKind::OpenAi => trimmed,
+                ProviderKind::Ollama => trimmed,
             })
         })
         .map_or_else(|| trimmed.to_string(), ToOwned::to_owned)
@@ -160,6 +174,15 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
         });
     }
+    // Add Ollama detection
+    if canonical.contains("ollama") || canonical.starts_with("llama") || canonical.starts_with("mistral") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::Ollama,
+            auth_env: "OLLAMA_API_KEY",
+            base_url_env: "OLLAMA_BASE_URL",
+            default_base_url: ollama::DEFAULT_OLLAMA_URL,
+        });
+    }
     None
 }
 
@@ -168,6 +191,12 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     if let Some(metadata) = metadata_for_model(model) {
         return metadata.provider;
     }
+    
+    // Check if Ollama is configured
+    if std::env::var("OLLAMA_MODEL").is_ok() || ollama::has_ollama_available() {
+        return ProviderKind::Ollama;
+    }
+    
     if anthropic::has_auth_from_env_or_saved().unwrap_or(false) {
         return ProviderKind::Anthropic;
     }
@@ -185,6 +214,8 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
     let canonical = resolve_model_alias(model);
     if canonical.contains("opus") {
         32_000
+    } else if canonical.contains("llama") || canonical.contains("mistral") {
+        16_000 // Typical Ollama models
     } else {
         64_000
     }
@@ -214,5 +245,11 @@ mod tests {
     fn keeps_existing_max_token_heuristic() {
         assert_eq!(max_tokens_for_model("opus"), 32_000);
         assert_eq!(max_tokens_for_model("grok-3"), 64_000);
+    }
+
+    #[test]
+    fn detects_ollama_models() {
+        assert_eq!(detect_provider_kind("llama2"), ProviderKind::Ollama);
+        assert_eq!(detect_provider_kind("mistral"), ProviderKind::Ollama);
     }
 }
